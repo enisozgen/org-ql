@@ -14,6 +14,117 @@ In branch =wip/helm-org-ql=.  Works really well, should add it and demonstrate i
 
 *** TODO Demonstrate
 
+*** UNDERWAY Parsing non-Lisp queries
+
+[2019-09-12 Thu 12:56]  Lisp is so much easier to deal with, but some people don't like parentheses.  So I'm trying to add a non-Lisp-style query syntax.  It gets complicated.  The =peg= library helps, but its documentation is sparse and incomplete.  This seems to work fairly well for single-token queries, but I'm not sure if I can or should cram it all into one parser, or use separate ones for certain keywords.
+
+#+BEGIN_SRC elisp
+  (-let* ((input "todo:check|someday")
+          (input "tags:universe+space")
+          (input "heading:\"spaced phrase\"")
+          (input "")
+          (input "heading:\"spaced phrase\"+another")
+          combinator
+          (parsed (peg-parse-string ((predicate (substring keyword) ":" (opt args))
+                                     (keyword (or "heading" "tags" "todo" "property"))
+                                     (args (+ (and (or quoted-arg unquoted-arg) (opt separator))))
+                                     (quoted-arg "\"" unquoted-arg "\"")
+                                     (unquoted-arg (substring (+ (not (or separator "\"")) (any))))
+                                     (separator (or (and "|" (action (setf combinator 'or)))
+                                                    (and "+" (action (setf combinator 'and)))
+                                                    (and ":" (action (setf combinator 'arg))))))
+                                    input 'noerror))
+          ((predicate . args) (nreverse parsed)))
+    (when predicate
+      (list :predicate predicate :args args :combinator combinator)))
+  ;;=> (:predicate "heading" :args ("spaced phrase" "another" t) :combinator and)
+#+END_SRC
+
+I don't know where the =t= is coming from.
+
+The next step is to make it work with multi-token queries.  It needs to handle all of the tokens in one parser so it can handle quoted phrases (if we split on spaces, it would split quoted phrases).  But that makes getting the arguments out of it more difficult.  Probably need to do something like this:
+
+#+BEGIN_SRC elisp
+  (-let* ((input "todo:check|someday")
+          (input "tags:universe+space")
+          (input "heading:\"spaced phrase\"")
+          (input "")
+          (input "heading:\"spaced phrase\"+another")
+          combinator
+          (parsed (peg-parse-string ((query (+ (or (and predicate `(pred args -- (list :predicate pred :args args)))
+                                                   (and plain-string `(s -- (list :predicate 'regexp :args s))))
+                                               (opt (syntax-class whitespace))))
+                                     (plain-string (substring (+ (not (syntax-class whitespace)) (any))))
+                                     (predicate (substring keyword) ":" (opt args))
+                                     (keyword (or "heading" "tags" "todo" "property"))
+                                     (args (+ (and (or quoted-arg unquoted-arg) (opt separator))))
+                                     (quoted-arg "\"" unquoted-arg "\"")
+                                     (unquoted-arg (substring (+ (not (or separator "\"")) (any))))
+                                     (separator (or (and "|" (action (setf combinator 'or)))
+                                                    (and "+" (action (setf combinator 'and)))
+                                                    (and ":" (action (setf combinator 'arg))))))
+                                    input 'noerror)))
+    parsed)
+#+END_SRC
+
+In which lists are pushed onto the stack and returned, rather than strings.  But I don't understand yet exactly how to use the =var= forms to consume input from the "value stack"; I need to study the examples more.  I'm also not sure if that will even work with a variable number of arguments.
+
+This seems to work, but we'll have to parse the args again in a separate step:
+
+#+BEGIN_SRC elisp
+  (-let* ((input "todo:check|someday")
+          (input "tags:universe+space")
+          (input "heading:\"spaced phrase\"")
+          (input "")
+          (input "heading:\"spaced phrase\"+another")
+          (input "heading:\"spaced phrase\"+another todo:check")
+          combinator
+          (parsed (peg-parse-string ((query (+ (or (and predicate `(pred args -- (list :predicate pred :args args)))
+                                                   (and plain-string `(s -- (list :predicate 'regexp :args s))))
+                                               (opt (+ (syntax-class whitespace) (any)))))
+                                     (plain-string (substring (+ (not (syntax-class whitespace)) (any))))
+                                     (predicate (substring keyword) ":" (opt args))
+                                     (keyword (or "heading" "tags" "todo" "property"))
+                                     (args (substring (+ (and (or quoted-arg unquoted-arg) (opt separator)))))
+                                     (quoted-arg "\"" (+ (not (or separator "\"")) (any)) "\"")
+                                     (unquoted-arg (+ (not (or separator "\"" (syntax-class whitespace))) (any)))
+                                     (separator (or (and "|" (action (setf combinator 'or)))
+                                                    (and "+" (action (setf combinator 'and)))
+                                                    (and ":" (action (setf combinator 'arg))))))
+                                    input 'noerror)))
+    parsed)
+    ;;=> (t (:predicate "todo" :args "check") (:predicate "heading" :args "\"spaced phrase\"+another"))
+#+END_SRC
+
+Well, a bit of fiddling (lots of trial-and-error required) produced this:
+
+#+BEGIN_SRC elisp
+  (-let* ((input "todo:check|someday")
+          (input "tags:universe+space")
+          (input "heading:\"spaced phrase\"")
+          (input "")
+          (input "heading:\"spaced phrase\"+another")
+          (input "heading:\"spaced phrase\"+another todo:check")
+          combinator
+          (parsed (peg-parse-string ((query (+ (or (and predicate `(pred args -- (list :predicate pred :args args)))
+                                                   (and plain-string `(s -- (list :predicate 'regexp :args s))))
+                                               (opt (+ (syntax-class whitespace) (any)))))
+                                     (plain-string (substring (+ (not (syntax-class whitespace)) (any))))
+                                     (predicate (substring keyword) ":" (opt args))
+                                     (keyword (or "heading" "tags" "todo" "property"))
+                                     (args (list (+ (and (substring (or quoted-arg unquoted-arg)) (opt separator)))))
+                                     (quoted-arg "\"" (+ (not (or separator "\"")) (any)) "\"")
+                                     (unquoted-arg (+ (not (or separator "\"" (syntax-class whitespace))) (any)))
+                                     (separator (or (and "|" (action (setf combinator 'or)))
+                                                    (and "+" (action (setf combinator 'and)))
+                                                    (and ":" (action (setf combinator 'arg))))))
+                                    input 'noerror)))
+    parsed)
+    ;;=> (t (:predicate "todo" :args ("check")) (:predicate "heading" :args ("\"spaced phrase\"" "another")))
+#+END_SRC
+
+That seems pretty usable!
+
 ** TODO [#B] Timeline view
 
 e.g. as mentioned by Samuel Wales at https://lists.gnu.org/archive/html/emacs-orgmode/2019-08/msg00330.html.  Prototype code:
